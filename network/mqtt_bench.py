@@ -405,8 +405,12 @@ def summarize(common: dict, rows: list[dict], msgs: list[dict], wholes: list[dic
                    e2e_p90_ms=e2e[int(0.9 * (len(e2e) - 1))],
                    msg_tx_B=int(statistics.median(f("tx_B"))), msg_rx_B=int(statistics.median(f("rx_B"))))
         air = [float(m["air_us"]) for m in msgs if m.get("air_us")]  # the Pico's UDP uplink to the air (ChirpStack runs)
-        if air:
+        if air:  # AIR=radio: its time on air, measured (lora_send)
             out.update(**stats("air", air, "us"))
+        calc = [(float(m["air_us"]), float(m["air_calc_us"])) for m in msgs if m.get("air_us") and m.get("air_calc_us")]
+        if calc:  # AIR=radio: RadioLib's formula for the same frames, and measured / formula (about 1.00 if they agree)
+            out.update(**stats("air_calc", [c for _, c in calc], "us"),
+                       air_meas_over_calc=round(statistics.median(a / c for a, c in calc), 4))
         for k in ("seal_cyc", "open_cyc", "seal256_cyc", "open256_cyc", "reply_open_cyc", "reply_open256_cyc"):
             # the Pico's CPU cycles (air-only ChirpStack firmware); *256: lorawan11_e2e's 256-bit layer on its own;
             # reply_open: the application's reply opened

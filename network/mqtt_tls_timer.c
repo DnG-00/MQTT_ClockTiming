@@ -44,7 +44,7 @@
  * Air mode (AIR=1, MSGS > 0): a LoRaWAN device with no broker, as on a radio: host / port are the virtual gateway's
  * air (network/virtual_gateway.py --air), and each of MSGS sealed uplinks goes there as one UDP datagram. AIR_LISTEN=<s>:
  * then wait that long for downlinks on the same socket (Class A: after an uplink), check and print them. Rows:
- *   air,idx,fcnt,seal_us,send_us    down,fcnt,<scheme>,<reading>    (send_us: the sendto(), not LoRa airtime)
+ *   air,idx,fcnt,seal_us,send_us,seal_cyc    down,fcnt,<scheme>,<reading>    (send_us: the sendto(), not LoRa airtime)
  *
  * OTAA (air mode; OTAA = 1.0.3, 1.0.4 or 1.1, the version of the device's profile in ChirpStack): the device joins
  * first. It sends a join-request (DEV_EUI, and JOIN_EUI, default 0000000000000000: 16 hex as ChirpStack shows them;
@@ -62,7 +62,8 @@
  * stdout: "#lib <version>", "#suite <negotiated TLS suite>", then CSV
  *   iter,tcp_ms,tls_ms,mqtt_ms,total_ms,hs_tx_B,hs_rx_B,mqtt_tx_B,mqtt_rx_B
  * and with MSGS > 0 also
- *   msg,iter,idx,seal_us,rtt_us,open_us,tx_B,rx_B      (per message; tx/rx = bytes on the socket)
+ *   msg,iter,idx,seal_us,rtt_us,open_us,tx_B,rx_B,seal_cyc,open_cyc   (per message; tx/rx = bytes on the socket;
+ *     *_cyc: CPU cycles of seal / open, Linux only (perf_event_open), empty without a counter: the "#cycles" line says)
  *   whole,iter,first_ms,all_ms,msgs                     (per connection, the pipeline as a whole: from the TCP connect
  *     to the first reading verified after its trip through the broker, and to the last one)
  * Any failure: reason on stderr, exit 1 (the driver records it as the result).
@@ -135,6 +136,48 @@ static double now_ms(void) {
     struct timespec t; clock_gettime(TIMER_CLOCK, &t);
     return t.tv_sec * 1e3 + t.tv_nsec / 1e6;
 }
+/* CPU cycles of this process in user space (Linux: perf_event_open, the core's PMU; the kernel's own cycles, the read()
+ * included, are left out), for seal / open: the same column names as the Pico's seal_cyc / open_cyc. cyc_init() once;
+ * cyc_now() is 0 without a counter (macOS; a container or kernel that refuses it: kernel.perf_event_paranoid > 2, no
+ * PMU in a VM), and the columns are then empty, not 0. cyc_overhead: what an empty measurement counts (the median of
+ * 63 back-to-back reads), subtracted from each one. On a Pi: the performance governor, a core of its own (taskset)
+ * and vcgencmd get_throttled 0x0 keep cycles per us steady. */
+static uint64_t cyc_overhead;
+static const char *cyc_why = "not Linux";
+#ifdef __linux__
+#include <linux/perf_event.h>
+#include <sys/syscall.h>
+static int cyc_fd = -1;
+static uint64_t cyc_now(void) {
+    uint64_t v = 0;
+    return cyc_fd >= 0 && read(cyc_fd, &v, sizeof v) == (ssize_t)sizeof v ? v : 0;
+}
+static int cmp_u64(const void *a, const void *b) {
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return x < y ? -1 : x > y;
+}
+static void cyc_init(void) {
+    struct perf_event_attr a;
+    memset(&a, 0, sizeof a);
+    a.type = PERF_TYPE_HARDWARE; a.size = sizeof a; a.config = PERF_COUNT_HW_CPU_CYCLES;
+    a.exclude_kernel = 1; a.exclude_hv = 1;  /* user space only: allowed at perf_event_paranoid 2, Debian's default */
+    cyc_fd = (int)syscall(SYS_perf_event_open, &a, 0, -1, -1, 0);  /* this thread, on whichever core it runs */
+    if (cyc_fd < 0) { cyc_why = strerror(errno); return; }
+    uint64_t d[63];
+    for (int i = 0; i < 63; i++) { uint64_t c0 = cyc_now(); d[i] = cyc_now() - c0; }
+    if (!d[0] && !cyc_now()) { close(cyc_fd); cyc_fd = -1; cyc_why = "the counter reads 0 (no PMU?)"; return; }
+    qsort(d, 63, sizeof *d, cmp_u64);
+    cyc_overhead = d[31];
+}
+#else
+static uint64_t cyc_now(void) { return 0; }
+static void cyc_init(void) {}
+#endif
+static uint64_t cyc_since(uint64_t c0) {  /* cycles since c0, less an empty measurement's; 0 = no counter */
+    uint64_t c = cyc_now();
+    return c && c0 ? (c - c0 > cyc_overhead ? c - c0 - cyc_overhead : 1) : 0;
+}
+static void put_cyc(uint64_t v) { if (v) printf(",%llu", (unsigned long long)v); else printf(","); }  /* empty: none */
 static void die(const char *what, const char *why) { fprintf(stderr, "%s: %s\n", what, why); exit(1); }
 /* why a certificate / key file didn't load: unreadable (e.g. made with sudo, or missing), else the TLS library's
  * reason. A certs/ that isn't the broker's usually shows up as a key that doesn't match its certificate. */
@@ -418,7 +461,9 @@ static void pipeline(conn_t *c, int iter, int msgs, int payload, const char *top
         uint32_t fc = next_fcnt();
         reading(pt, payload, (int)fc);
         double t0 = now_us();
+        uint64_t c0 = cyc_now();
         int fl = app_seal(down, fc, pt, payload, frame);
+        uint64_t seal_cyc = cyc_since(c0);
         double t1 = now_us();
         if (fl < 0) die("payload too large for", app_aead_label());
         int n = publish_packet(pkt, topic, frame, (size_t)fl);
@@ -430,13 +475,17 @@ static void pipeline(conn_t *c, int iter, int msgs, int payload, const char *top
         double t2 = now_us();
         if (len < 0) die("mqtt publish failed", "no echo from broker");
         int off = 2 + (body[0] << 8 | body[1]);
-        if (app_open(body + off, len - off, out) != payload || memcmp(out, pt, payload))
-            die("payload verification failed", app_aead_label());
+        c0 = cyc_now();
+        int ol = app_open(body + off, len - off, out);
+        uint64_t open_cyc = cyc_since(c0);
+        if (ol != payload || memcmp(out, pt, payload)) die("payload verification failed", app_aead_label());
         double t3 = now_us();
         if (m == 0) first = now_ms() - t_conn;
-        if (report)
-            printf("msg,%d,%d,%.3f,%.3f,%.3f,%llu,%llu\n", iter, m, t1 - t0, t2 - t1, t3 - t2,
+        if (report) {
+            printf("msg,%d,%d,%.3f,%.3f,%.3f,%llu,%llu", iter, m, t1 - t0, t2 - t1, t3 - t2,
                    (unsigned long long)(c->tx - tx0), (unsigned long long)(c->rx - rx0));
+            put_cyc(seal_cyc); put_cyc(open_cyc); printf("\n");
+        }
     }
     if (report && msgs > 0) printf("whole,%d,%.3f,%.3f,%d\n", iter, first, now_ms() - t_conn, msgs);
 }
@@ -718,17 +767,21 @@ static void air_device(const char *host, const char *port, int msgs, int payload
     if (getaddrinfo(host, port, &hints, &ai) != 0) die("cannot resolve", host);
     int fd = socket(ai->ai_family, SOCK_DGRAM, 0);
     if (otaa) air_join(fd, ai);
-    printf("#aead %s (%s), uplink over the air (UDP to %s:%s), %d B payload + %d B overhead\nair,idx,fcnt,seal_us,send_us\n",
+    printf("#aead %s (%s), uplink over the air (UDP to %s:%s), %d B payload + %d B overhead\n"
+           "air,idx,fcnt,seal_us,send_us,seal_cyc\n",
            app_aead_label(), app_aead_library(), host, port, payload, app_aead_overhead());
     for (int m = 0; m < msgs; m++) {
         uint32_t fc = next_fcnt();
         reading(pt, payload, (int)fc);
         double t0 = now_us();
+        uint64_t c0 = cyc_now();
         int fl = app_seal(0, fc, pt, payload, fr);
+        uint64_t seal_cyc = cyc_since(c0);
         double t1 = now_us();
         if (fl < 0) die("payload too large for", app_aead_label());
         if (sendto(fd, fr, (size_t)fl, 0, ai->ai_addr, ai->ai_addrlen) != fl) die("air send failed", strerror(errno));
-        printf("air,%d,%u,%.3f,%.3f\n", m, fc, t1 - t0, now_us() - t1);
+        printf("air,%d,%u,%.3f,%.3f", m, fc, t1 - t0, now_us() - t1);
+        put_cyc(seal_cyc); printf("\n");
     }
     fflush(stdout);
     struct timeval tmo = {1, 0};  /* wait in 1 s slices */
@@ -868,6 +921,10 @@ int main(int argc, char **argv) {
         if (app_aead_init(aead)) die("unknown or unavailable AEAD", aead);
         if (app_aead_selftest()) die("app_aead self-check failed", aead);
         use_shared_keys();  /* the self-test re-keys randomly, so after it */
+        cyc_init();
+        if (cyc_now()) printf("#cycles perf_event_open: CPU cycles in user space, %llu subtracted per measurement\n",
+                              (unsigned long long)cyc_overhead);
+        else printf("#cycles none (%s): the *_cyc columns stay empty\n", cyc_why);
     }
 
     if (air_mode()) {  /* air mode: no broker, frames as UDP datagrams */
@@ -915,7 +972,7 @@ int main(int argc, char **argv) {
 #else
     printf("iter,tcp_ms,tls_ms,mqtt_ms,total_ms,hs_tx_B,hs_rx_B,mqtt_tx_B,mqtt_rx_B,hs_writes,hs_reads,writes,reads,tx_segs,rx_segs\n");
 #endif
-    if (msgs > 0) printf("msg,iter,idx,seal_us,rtt_us,open_us,tx_B,rx_B\nwhole,iter,first_ms,all_ms,msgs\n");
+    if (msgs > 0) printf("msg,iter,idx,seal_us,rtt_us,open_us,tx_B,rx_B,seal_cyc,open_cyc\nwhole,iter,first_ms,all_ms,msgs\n");
 #ifdef HAVE_LIBOQS
     if (kem) {
         kem_t k;

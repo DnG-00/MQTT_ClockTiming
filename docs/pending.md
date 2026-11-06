@@ -98,6 +98,33 @@ broker (`./run_all.sh --serve-broker`, :18835). **Device** = the Pico W.
     `lorawan11`, 1.1) compiles for the Pico W and Pico 2 W, for a same-board comparison. Left: the runs, each flash
     stating ABP or OTAA (ABP only so far); an ESP32 as a second AES-128 device (when it arrives); ChirpStack's own AES
     cost at both commits.
+11. [ ] **Timing and cycles across the pipeline** (5 Nov, branch `feature/clock-timing`): each number on one clock,
+    cycles per chip only, the cross-machine legs on synced clocks.
+    - [~] the Pico's time on air, measured (`AIR=radio`): `lora_send` starts the clock once `startTransmit` returns
+      and stops it in the SX1262's TX-done interrupt on DIO1 (no longer around the blocking `transmit()`, which held
+      the SPI set-up and RadioLib's polling); RX1 / RX2 now count from that interrupt. `air_us` is the measured time,
+      the new last column `air_calc_us` RadioLib's formula (`getTimeOnAir`); the summary adds `air_calc_*_us` and
+      `air_meas_over_calc` (about 1.00 if they agree). Parsing checked (`mqtt_parse_test.py`'s air blocks); not
+      compiled or run on the board yet.
+    - [~] cycle counts in the host tool: `seal_cyc` / `open_cyc` on its `msg` rows and `seal_cyc` on its `air` rows
+      (`perf_event_open`, user-space cycles; a read's own cost measured at start and subtracted; empty columns and a
+      `#cycles none (<reason>)` line without a counter). The summary picks them up by name, as the Pico's. Checked in
+      the dev container: Docker's default seccomp refuses the call (`Operation not permitted`: empty columns); with
+      it lifted the counter runs, ~3,000 cycles per lorawan11_256 seal after a cold first message. Not run on a Pi.
+    - [~] the STM32's cycles: `DWT->CYCCNT`, the library's `SecureElementComputeAesCmac` / `VerifyAesCmac` /
+      `AesEncrypt` through `-Wl,--wrap` (`run_node.sh`; its link map checked for each wrapper after the build), one
+      `cyc,...` CSV row per uplink (a header once at start), uplink and downlink apart. `run_node.sh log` turns the
+      rows into `results/stm32_<device>_cyc.csv` as they come (`stm32/cyc_csv.py`: the time, cycles and µs per
+      step, the downlink's columns empty without one; `--summary` the medians, `--selftest` its checks). Compiled for
+      the LM402 with STM32duino 3.0.0 and STM32duinoLoRaWAN 0.5.1 in the dev container (94,184 B; all three wrappers
+      linked); the converter checked on a simulated live log (each row in the CSV as it came); not flashed.
+    - [~] chrony between the two Pis: `scripts/clock_sync.sh` (`server` on the broker Pi, `client <ip>` on the
+      gateway Pi; `status`, `undo`), the offset and chrony's error bound logged every 5 s (`clock_offset.csv`), started
+      and stopped by `broker.sh` and `app.sh`; testbed step 7b. Checked with chrony 4.6.1 (Debian 13) in the
+      container against a public server (`chronyd -x`): the config, the log's columns and the offset's sign against
+      `chronyc tracking`, the logger's start / stop. Not run on the Pis.
+    - [ ] the gateway -> broker leg (vgw.log's "sent" -> broker_events.csv's gateway uplink, within its error bound)
+    - [ ] one summary per run: cycles, the legs, the round trip, the RX1 slack
 
 ## Paused / KIV
 

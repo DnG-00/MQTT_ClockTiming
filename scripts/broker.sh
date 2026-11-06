@@ -32,8 +32,11 @@ case "${1:-}" in
         # a listener that didn't open (a missing certificate, a file Mosquitto can't read: run it as yourself, not
         # with sudo, which makes Mosquitto 2 drop to its own user) is printed there, but the process stays up
         if running && ! grep -q "could not start\|no certificate" $LOG; then echo "started (pid $(cat $PID)), log $LOG:"; head -4 $LOG
-        else echo "failed to start:"; tail -5 $LOG; running && kill "$(cat $PID)"; rm -f $PID; exit 1; fi ;;
+        else echo "failed to start:"; tail -5 $LOG; running && kill "$(cat $PID)"; rm -f $PID; exit 1; fi
+        # this Pi's clock against its source, beside the broker's CSV (scripts/clock_sync.sh; nothing without chrony)
+        bash scripts/clock_sync.sh log start || true ;;
     stop)  # SIGTERM: mqtt_bench.py stops its Mosquitto processes too
+        bash scripts/clock_sync.sh log stop || true
         if running; then kill "$(cat $PID)"; rm -f $PID; echo stopped; else echo "not running"; fi ;;
     restart) "$0" stop; sleep 1; "$0" start ;;
     status) if running; then echo "running (pid $(cat $PID))"; else echo "not running"; exit 1; fi ;;

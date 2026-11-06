@@ -176,4 +176,14 @@ sa = bmm.summarize({}, air[0]["rows"], air[0]["msgs"])
 assert (sa["seal_median_cyc"], sa["open_median_cyc"], sa["replies"], sa["reply_median_ms"]) == (141215.0, 127820.0, 1, 640.1), sa
 assert (sa["seal256_median_cyc"], sa["open256_median_cyc"]) == (96200.0, 84200.0), sa
 assert (sa["reply_open_median_cyc"], sa["reply_open256_median_cyc"]) == (163000.0, 86000.0), sa
+assert "air_calc_median_us" not in sa and "air_meas_over_calc" not in sa, sa  # Wi-Fi rows: no formula column
+# AIR=radio: the measured time on air beside RadioLib's formula (the new last column), and their ratio
+rad = r.mqtt_blocks(f"=== x on RP2040 ===\n#block pipeline air lorawan11_256 up\n#lib none (LoRa air only)\n{H}\n"
+                    "msg,iter,idx,seal_us,rtt_us,open_us,tx_B,rx_B,air_us,seal_cyc,open_cyc,reply_us,seal256_cyc,"
+                    "open256_cyc,reply_open_cyc,reply_open256_cyc,air_calc_us\n"
+                    "0,0,0,0,0,0,0,0,0,0,0,0,0\nmsg,0,0,705,0,638,0,0,2630000,141020,127630,3700000,,,163000,,2629632\n"
+                    "msg,0,1,707,0,640,0,0,2630400,141410,128010,,,,,,2629632\n#end\n")
+sr = bmm.summarize({}, rad[0]["rows"], rad[0]["msgs"])
+assert (sr["air_median_us"], sr["air_calc_median_us"]) == (2630200.0, 2629632.0), sr
+assert sr["air_meas_over_calc"] == 1.0002, sr
 print("mqtt_parse_test: OK")

@@ -113,6 +113,9 @@ git -C network/chirpstack log --oneline -1     # the fork commit this branch bui
 │   │                             both kept 3 days, KEEP_DAYS: at midnight <name>-<date>, older ones deleted)
 │   ├── app.sh                  ← the gateway's machine: the virtual gateway and the application (chirpstack_app.py,
 │   │                             its watcher and relay), start / stop / restart / status / log
+│   ├── clock_sync.sh           ← chrony on the two Pis (the broker Pi serving, the gateway Pi following it), for the
+│   │                             one leg timed across them; the offset and its error bound logged every 5 s
+│   │                             (clock_offset.csv, started and stopped by broker.sh and app.sh)
 │   ├── chirpstack/Dockerfile   ← our ChirpStack image: UI (node 22) → server (rust 1.89) → debian-slim
 │   ├── gateway-bridge/Dockerfile ← the Gateway Bridge v4.1.2, unchanged, built with Go 1.27 (ML-DSA)
 │   ├── chirpstack_pq_setup.sh  ← machine 1: ChirpStack's certificates and config (docker-compose.override.yml);
@@ -146,7 +149,9 @@ git -C network/chirpstack log --oneline -1     # the fork commit this branch bui
 ├── stm32/
 │   ├── lorawan_node/           ← the STM32WL test device (the LM402 kit): ABP, LoRaWAN 1.0.3, AES-128; an uplink a minute,
 │   │                             the downlink back, both printed (ST's stack: STM32duinoLoRaWAN)
-│   └── run_node.sh             ← build it with its keys (the provisioning file), flash it, follow its serial log
+│   ├── run_node.sh             ← build it with its keys (the provisioning file), flash it, follow its serial log
+│   └── cyc_csv.py              ← its per-uplink cycle rows (ST's LoRaWAN crypto: MIC, AES; up and down) → a CSV with
+│                                 the cycles in µs; run_node.sh log writes it as the rows come
 └── certs/  results/            ← made by the runs (gitignored)
 ```
 

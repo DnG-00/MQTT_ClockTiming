@@ -40,8 +40,12 @@ print(json.load(open(os.path.expanduser(sys.argv[1])))["devices"][sys.argv[2]]["
         echo $! >> $PIDS
         sleep 3
         if running && grep -q subscribed $D/watch.err; then echo "started, logs in $D/: $(cat $D/watch.err)"
-        else echo "failed to start:"; tail -3 $D/watch.err $D/relay.log $D/app.log $D/vgw.log; "$0" stop; exit 1; fi ;;
+        else echo "failed to start:"; tail -3 $D/watch.err $D/relay.log $D/app.log $D/vgw.log; "$0" stop; exit 1; fi
+        # this Pi's clock against the broker Pi's (scripts/clock_sync.sh client): the error bound for the gateway ->
+        # broker leg, beside vgw.log, on the same clock as its "sent" times; nothing without chrony
+        CLOCK_LOG=$D/clock_offset.csv bash scripts/clock_sync.sh log start || true ;;
     stop)  # the watcher first: the application reads the end of its input, prints its summary and writes app.csv
+        CLOCK_LOG=$D/clock_offset.csv bash scripts/clock_sync.sh log stop || true
         if [ -f $PIDS ]; then
             set -- $(cat $PIDS)  # the virtual gateway, the application, the watcher, the relay
             kill ${3:-} 2>/dev/null || true

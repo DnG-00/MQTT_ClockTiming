@@ -291,6 +291,25 @@ nohup python3 -u network/virtual_gateway.py --air 0.0.0.0:1680 >> results/testbe
 pkill -f 'virtual_gateway.py --air'      # (to stop it)
 ```
 
+## 7b. Both Pis: one clock
+
+Only for the leg that starts on the gateway Pi and ends on the broker Pi (a frame sent -> its message at the broker):
+every other leg is timed on one machine already. chrony, the broker Pi as the reference, the gateway Pi following it
+alone. The two Pis on wired Ethernet: Wi-Fi's jitter is milliseconds, the size of the legs.
+
+```bash
+# broker Pi, repo root (sudo asked for once: chrony installed, /etc/chrony/chrony.conf rewritten, the original kept)
+scripts/clock_sync.sh server                    # serves this Pi's /24; UPSTREAM=none for a lab without internet
+# gateway Pi, repo root
+scripts/clock_sync.sh client $BRK               # "following <ip>", within a minute; else it says what to check
+scripts/clock_sync.sh status                    # either Pi: the offset now, the sources (the broker: ^*)
+```
+
+`broker.sh` and `app.sh` start and stop the offset log with themselves: `results/clock_offset.csv` (broker Pi) and
+`results/testbed/clock_offset.csv` (gateway Pi), a row every 5 s with chrony's offset and its error bound
+(`err_bound_s`). The gateway Pi's file is the one for the leg. `scripts/clock_sync.sh undo` puts chrony's own
+configuration back.
+
 ## 8. The PC: Home Assistant, the application
 
 Home Assistant 2026.10.4 (the version tested; its OpenSSL is 3.5.9) in Docker, its configuration in a Docker volume
@@ -464,7 +483,15 @@ PORT=/dev/cu.usbmodem1103 stm32/run_node.sh
 
 Each uplink prints `#up <n> FCnt <f> DR<d>: <ms> ms` (the send to the end of its receive windows), then
 `#down <n> FCntDown <f> port 1 RSSI <r> SNR <s>: ack <f>` (Home Assistant's answer to that FCnt: the device got it) or
-`#down <n> none`, and `#count up <u> down <d>`.
+`#down <n> none`, and `#count up <u> down <d>`; and a `cyc,...` row: the CPU cycles in ST's LoRaWAN crypto for that
+uplink (its MIC and AES) and for its answer. `run_node.sh log` writes those rows as they come into
+`results/stm32_stm32-c13-abp-aes128_cyc.csv`, one row per uplink, the cycles also in µs (at the `#cpu` line's MHz),
+the answer's columns empty when none came:
+
+```bash
+python3 stm32/cyc_csv.py --summary results/stm32_stm32-c13-abp-aes128.log > /dev/null   # the medians per column
+python3 stm32/cyc_csv.py results/stm32_stm32-c13-abp-aes128.log > cyc.csv              # the CSV again from the log
+```
 
 - **The kit, before the first flash:** the antenna on; SW3 on (the module's power); J1's jumpers on 5-6, 7-8 and 9-10
   (the ST-Link's SWDIO, SWCLK and NRST to the module) and 11-12, 13-14 (its serial port to PA2 / PA3).
@@ -499,6 +526,11 @@ legs = collections.defaultdict(list)
 for r in (r for f in sorted(glob.glob("results/broker_events*.csv")) for r in csv.DictReader(open(f))):
     if r["leg_ms"]: legs[r["leg"] + (" " + r["from_link"] if r["event"] == "connect" else "")].append(float(r["leg_ms"]))
 for k, v in legs.items(): print(f"{k:30} n={len(v):<5} median {statistics.median(v):8.1f} ms  max {max(v):8.1f} ms")'
+# gateway Pi: its clock against the broker Pi's over the run (step 7b); a leg between the two counts when it is at least
+# 10x the largest err_bound_s here
+python3 -c 'import csv; r = list(csv.DictReader(open("results/testbed/clock_offset.csv")))
+e = [abs(float(x["offset_s"])) * 1e3 for x in r]; b = [float(x["err_bound_s"]) * 1e3 for x in r]; s = r[-1]["source"]
+print(f"{len(r)} rows, |offset| max {max(e):.3f} ms, err_bound max {max(b):.3f} ms, source {s}")'
 # the Mac: the Pico's replies in time, per uplink (lorawan11_256: all; lorawan11_e2e: none, step 8)
 awk -F, 'NR>1 && $6=="uplink" {n[$5]++; if ($18 > 0) r[$5]++} END {for (k in n) print k, r[k]+0 "/" n[k]}' \
   results/pipeline_msgs_raw_pico_rp2040_testbed_run1.csv

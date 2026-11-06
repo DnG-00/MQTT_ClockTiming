@@ -9,7 +9,9 @@
 # OpenOCDSTLink (an ST-Link, through the OpenOCD the STM32 package brings), swdMethod (an ST-Link through
 # STM32CubeProgrammer) or serialMethod (UART with BOOT0 high; PORT and STM32CubeProgrammer). PORT: the serial port
 # (the kit: its ST-Link's, /dev/cu.usbmodem*). NODE_S, NODE_DR: as in the sketch (60 s, DR0).
-# Log: results/stm32_<DEVICE>.log, appended, each line timed. The keys go into a header in a folder of its own
+# Log: results/stm32_<DEVICE>.log, appended, each line timed; and results/stm32_<DEVICE>_cyc.csv, a row per uplink:
+# the library's LoRaWAN crypto in cycles and us (stm32/cyc_csv.py; from a kept log: python3 stm32/cyc_csv.py <log>).
+# The keys go into a header in a folder of its own
 # (0700), deleted after the build, and are never printed; the build folder's binary has them, like the Pico's.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -26,7 +28,7 @@ case ${BOARD:-lm402} in
     *) FQBN=$BOARD RADIO="" ;;  # a board whose variant has its radio (RAK3172, Nucleo-WL55JC1, LoRa-E5 mini)
 esac
 FQBN+=,upload_method=${UPLOAD:-OpenOCDSTLink}
-OUT=${TMPDIR:-/tmp}/stm32_node_$DEVICE LOG=results/stm32_$DEVICE.log
+OUT=${TMPDIR:-/tmp}/stm32_node_$DEVICE LOG=results/stm32_$DEVICE.log CSV=results/stm32_${DEVICE}_cyc.csv
 P=(); [ -n "${PORT:-}" ] && P=(-p "$PORT")
 # OpenOCD attaches with NRST held low (connect under reset): firmware that sleeps or turns SWD off (ST's samples, the
 # kit's factory firmware) can't be reached otherwise. Needs NRST wired to the ST-Link (the kit: J1 9-10)
@@ -55,16 +57,28 @@ with open(os.open(out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
     f.writelines(f'#define {k} "{x}"\n' for k, x in v.items())
     f.write(f"#define NODE_S {node_s}\n#define NODE_DR {dr}\n")
 PY
-    # the radio's flags reach the library's C files (its radio_board_if.c) too
+    # the radio's flags reach the library's C files (its radio_board_if.c) too. The link: the library's secure-element
+    # AES / CMAC calls through the sketch's cycle counters (lorawan_node.ino, "Cycles")
+    W=-Wl,--wrap=SecureElementComputeAesCmac,--wrap=SecureElementVerifyAesCmac,--wrap=SecureElementAesEncrypt
     arduino-cli compile --fqbn "$FQBN" --build-path "$OUT" --build-property "compiler.c.extra_flags=$RADIO" \
-        --build-property "compiler.cpp.extra_flags=-I$G $RADIO" stm32/lorawan_node
+        --build-property "compiler.cpp.extra_flags=-I$G $RADIO" --build-property "compiler.c.elf.extra_flags=$W" \
+        stm32/lorawan_node
+    # the wraps took: each __wrap_ is in the linked image (the link map's memory map, not its discarded sections). One
+    # the library no longer calls across files would be garbage-collected and its #cyc count would stay 0
+    for f in ComputeAesCmac VerifyAesCmac AesEncrypt; do
+        awk -v s="__wrap_SecureElement$f" '/^Linker script and memory map/ {m = 1} m && $NF == s {k = 1} END {exit !k}' \
+            "$OUT/lorawan_node.ino.map" || echo "[!] __wrap_SecureElement$f not linked: its #cyc count stays 0" >&2
+    done
 }
 # -v: OpenOCD's reason when it fails (quiet, it says only "init failed")
 flash() { arduino-cli upload -v --fqbn "$FQBN" --input-dir "$OUT" "${P[@]}" "${U[@]}" stm32/lorawan_node; }
 log() {
     [ ${#P[@]} -gt 0 ] || { echo "PORT=<the serial port: arduino-cli board list>" >&2; exit 1; }
     mkdir -p results
-    arduino-cli monitor "${P[@]}" --config baudrate=115200 --timestamp --quiet | tee -a "$LOG"
+    # the raw log kept as it comes, shown, and each uplink's cycle row into the CSV as it comes (stm32/cyc_csv.py)
+    echo "log: $LOG, cycles per uplink: $CSV" >&2
+    arduino-cli monitor "${P[@]}" --config baudrate=115200 --timestamp --quiet | tee -a "$LOG" |
+        python3 -u stm32/cyc_csv.py --echo -o "$CSV"
 }
 case "${1:-all}" in
     build) build ;;

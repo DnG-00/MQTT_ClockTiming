@@ -66,7 +66,8 @@
 //   AIR=radio (-> MT_RADIO): the same frames over LoRa instead, on the Waveshare Pico-LoRa-SX1262 (SX126X) board, to a
 //   real gateway: AS923 channel 0 at DR0, as the frames' 1.1 MIC assumes (docs/radio_gateway.md); with REPLY_WAIT_MS,
 //   the reply in RX1 / RX2. No Wi-Fi: the radio needs none, and on a Pico W it would disturb the reception. air_us is
-//   then the time on air.
+//   then the time on air, measured: from startTransmit's return (the radio on air) to the SX1262's TX-done interrupt
+//   on DIO1 (lora_send); air_calc_us beside it is RadioLib's formula for the same frame (getTimeOnAir), to compare.
 //   NODE_S=<s> (-> MT_NODE_S, with AIR): a sensor node for Home Assistant instead of the blocks: after setup, one
 //   lorawan11_256 (AES=128: lorawan11) uplink (FPort 1) every MT_NODE_S s with the chip's own temperature, indefinitely, FCnt reserved in
 //   flash as in the blocks; with REPLY_WAIT_MS the reply too. It starts without a USB host (waits 5 s at most).
@@ -474,6 +475,13 @@ enum { R_SCK = 10, R_MOSI = 11, R_MISO = 12, R_NSS = 3, R_DIO1 = 20, R_RST = 15,
 #endif
 static SX1262 lora = new Module(R_NSS, R_DIO1, R_RST, R_BUSY, SPI1);
 static uint32_t tx_end;  // millis() when the last uplink had left: the RX windows count from it
+// the last uplink's time on air, us: measured (the radio on air -> its TX-done interrupt on DIO1) and RadioLib's formula
+// for the same frame and settings (getTimeOnAir); 0 if the send failed. The two agree within ~1 % unless a radio
+// setting (SF, coding rate, preamble, low-data-rate optimisation) isn't what the formula assumes
+static uint32_t air_meas_us, air_calc_us;
+static volatile bool dio1_hit;      // set by on_dio1, after dio1_at: once the loop sees it, dio1_at is whole
+static volatile uint64_t dio1_at;   // time_us_64() when DIO1 rose (64 bits: two words, hence the flag)
+static void on_dio1() { dio1_at = time_us_64(); dio1_hit = true; }
 static int lora_begin() {  // 0, or RadioLib's error
   SPI1.setSCK(R_SCK); SPI1.setTX(R_MOSI); SPI1.setRX(R_MISO);
   SPI1.begin();  // RadioLib doesn't start a bus it is given (begin -2 without: seen 27 Oct)
@@ -481,9 +489,24 @@ static int lora_begin() {  // 0, or RadioLib's error
   // word (0x34: 0x3444 on the SX126x), 14 dBm, preamble 8
   return lora.begin(923.2, 125.0, 12, 5, 0x34, 14, 8, MT_RADIO_TCXO_V);
 }
-static bool lora_send(const uint8_t *f, int n) {  // the uplink at DR0, IQ normal
-  bool ok = !lora.setSpreadingFactor(12) && !lora.invertIQ(false) && lora.transmit(f, n) == RADIOLIB_ERR_NONE;
-  tx_end = millis();
+// the uplink at DR0, IQ normal. Not RadioLib's blocking transmit(): its time would include the SPI set-up and its own
+// polling of DIO1. Here the clock starts once startTransmit has returned (its SetTx command sent: the radio is on air)
+// and stops in the interrupt the SX1262 raises on DIO1 at TX done.
+static bool lora_send(const uint8_t *f, int n) {
+  air_meas_us = air_calc_us = 0;
+  if (lora.setSpreadingFactor(12) || lora.invertIQ(false)) { tx_end = millis(); return false; }
+  uint32_t calc = (uint32_t)lora.getTimeOnAir(n);  // after setSpreadingFactor: the formula at SF12 for n bytes
+  dio1_hit = false;
+  lora.setDio1Action(on_dio1);
+  bool ok = lora.startTransmit(f, n) == RADIOLIB_ERR_NONE;
+  uint64_t t0 = time_us_64();
+  while (ok && !dio1_hit && time_us_64() - t0 < calc + 1000000u) rp2040.wdt_reset();  // TX done, or the formula + 1 s
+  lora.clearDio1Action();  // lora_rx polls DIO1 itself
+  ok = ok && dio1_hit && (lora.getIrqFlags() & RADIOLIB_SX126X_IRQ_TX_DONE);
+  lora.finishTransmit();   // standby, IRQ flags cleared
+  if (ok) { air_meas_us = (uint32_t)(dio1_at - t0); air_calc_us = calc; }
+  // RX1 / RX2 count from the end of the uplink: the interrupt's time (arduino-pico's millis() is time_us_64() / 1000)
+  tx_end = ok ? (uint32_t)(dio1_at / 1000) : millis();
   return ok;
 }
 // LoRaWAN class A: RX1 1 s after the uplink at its DR (ChirpStack's rx1_dr_offset 0: SF12), RX2 2 s after it at DR2
@@ -513,11 +536,11 @@ static bool air_send(const uint8_t *f, int n) {  // one uplink to the air: over 
 #endif
 }
 #define MSG_HDR "msg,iter,idx,seal_us,rtt_us,open_us,tx_B,rx_B,air_us,seal_cyc,open_cyc,reply_us,seal256_cyc,open256_cyc," \
-                "reply_open_cyc,reply_open256_cyc"
-// the air columns: the UDP send, seal / open in CPU cycles, the round trip, the 256-bit layer's own share of seal /
-// open (lorawan11_e2e only), and the application's reply opened (cycles, and its 256-bit layer's share); empty when
-// not measured
-enum { AIR_COLS = 8 };
+                "reply_open_cyc,reply_open256_cyc,air_calc_us"
+// the air columns: the UDP send (AIR=radio: the measured time on air), seal / open in CPU cycles, the round trip, the
+// 256-bit layer's own share of seal / open (lorawan11_e2e only), the application's reply opened (cycles, and its
+// 256-bit layer's share), and (AIR=radio) RadioLib's formula for the time on air; empty when not measured
+enum { AIR_COLS = 9 };
 static const char *air_col(const uint32_t *v) {  // AIR_COLS values
   static char s[12 * AIR_COLS];
   int n = 0;
@@ -526,7 +549,7 @@ static const char *air_col(const uint32_t *v) {  // AIR_COLS values
 }
 #else
 #define MSG_HDR "msg,iter,idx,seal_us,rtt_us,open_us,tx_B,rx_B"
-enum { AIR_COLS = 8 };
+enum { AIR_COLS = 9 };
 static const char *air_col(const uint32_t *) { return ""; }
 #endif
 #ifdef MT_DOWN_WAIT_MS
@@ -630,16 +653,22 @@ static const char *pipeline(Conn *c, int iter, int msgs, bool report, uint32_t t
     uint32_t t3 = micros();
     if (!ok) { snprintf(err, sizeof err, "payload verification failed: %s", sc.name); return err; }
     if (m == 0) first = micros() - t_conn;  // the 'whole' row: before the air send
-    uint32_t air_us = 0;  // the uplink to the air, timed apart from seal / round trip / open: Wi-Fi UDP, not LoRa airtime
+    // the uplink to the air, timed apart from seal / round trip / open: Wi-Fi UDP (the send, not LoRa airtime), or with
+    // AIR=radio the time on air, measured, and air_calc the formula's
+    uint32_t air_us = 0, air_calc = 0;
 #ifdef MT_AIR_ONLY
     uint32_t t4 = micros();
     if (!down && air_send(frame, fl)) air_us = micros() - t4;
+#ifdef MT_RADIO
+    if (air_us) { air_us = air_meas_us; air_calc = air_calc_us; }
+#endif
 #ifdef MT_DOWN_WAIT_MS
     if (!down) { last_up = millis(); reply_us = await_reply(t4, fcnt, &reply_cyc, &reply256); }  // fcnt: this uplink's
 #endif
 #endif
     STEP(S_SERIAL);
-    const uint32_t cols[AIR_COLS] = {air_us, cyc_seal, cyc_open, reply_us, seal256, open256, reply_cyc, reply256};
+    const uint32_t cols[AIR_COLS] = {air_us, cyc_seal, cyc_open, reply_us, seal256, open256, reply_cyc, reply256,
+                                     air_calc};
     if (report) Serial.printf("msg,%d,%d,%lu,%lu,%lu,%lu,%lu%s\n", iter, m, (unsigned long)(t1 - t0),
                               (unsigned long)(t2 - t1), (unsigned long)(t3 - t2), (unsigned long)(c->tx - tx0),
                               (unsigned long)(c->rx - rx0), air_col(cols));
@@ -1094,7 +1123,12 @@ static void node_send() {
 #ifdef MT_DOWN_WAIT_MS
   if (sent) reply_us = await_reply(t4, fcnt, &cyc, &cyc256);
 #endif
+#ifdef MT_RADIO  // the time on air, measured and the formula's (lora_send)
+  Serial.printf("#node fcnt=%lu %s sent=%d reply_ms=%lu air_us=%lu air_calc_us=%lu\n", (unsigned long)fcnt, s, sent,
+                (unsigned long)(reply_us / 1000), (unsigned long)air_meas_us, (unsigned long)air_calc_us);
+#else
   Serial.printf("#node fcnt=%lu %s sent=%d reply_ms=%lu\n", (unsigned long)fcnt, s, sent, (unsigned long)(reply_us / 1000));
+#endif
 }
 #endif
 

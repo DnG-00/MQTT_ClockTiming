@@ -44,7 +44,9 @@
  * Air mode (AIR=1, MSGS > 0): a LoRaWAN device with no broker, as on a radio: host / port are the virtual gateway's
  * air (network/virtual_gateway.py --air), and each of MSGS sealed uplinks goes there as one UDP datagram. AIR_LISTEN=<s>:
  * then wait that long for downlinks on the same socket (Class A: after an uplink), check and print them. Rows:
- *   air,idx,fcnt,seal_us,send_us,seal_cyc    down,fcnt,<scheme>,<reading>    (send_us: the sendto(), not LoRa airtime)
+ *   air,idx,fcnt,seal_us,send_us,seal_cyc,open_us,open_cyc    down,fcnt,<scheme>,<reading>
+ *   (send_us: the sendto(), not LoRa airtime; open_*: the same frame opened again after its send, as its receiver
+ *   would, MIC checked and payload decrypted, here on this machine: the receiver's cost on this CPU)
  *
  * OTAA (air mode; OTAA = 1.0.3, 1.0.4 or 1.1, the version of the device's profile in ChirpStack): the device joins
  * first. It sends a join-request (DEV_EUI, and JOIN_EUI, default 0000000000000000: 16 hex as ChirpStack shows them;
@@ -768,7 +770,7 @@ static void air_device(const char *host, const char *port, int msgs, int payload
     int fd = socket(ai->ai_family, SOCK_DGRAM, 0);
     if (otaa) air_join(fd, ai);
     printf("#aead %s (%s), uplink over the air (UDP to %s:%s), %d B payload + %d B overhead\n"
-           "air,idx,fcnt,seal_us,send_us,seal_cyc\n",
+           "air,idx,fcnt,seal_us,send_us,seal_cyc,open_us,open_cyc\n",
            app_aead_label(), app_aead_library(), host, port, payload, app_aead_overhead());
     for (int m = 0; m < msgs; m++) {
         uint32_t fc = next_fcnt();
@@ -780,8 +782,16 @@ static void air_device(const char *host, const char *port, int msgs, int payload
         double t1 = now_us();
         if (fl < 0) die("payload too large for", app_aead_label());
         if (sendto(fd, fr, (size_t)fl, 0, ai->ai_addr, ai->ai_addrlen) != fl) die("air send failed", strerror(errno));
-        printf("air,%d,%u,%.3f,%.3f", m, fc, t1 - t0, now_us() - t1);
-        put_cyc(seal_cyc); printf("\n");
+        double t2 = now_us();
+        /* the receiver's side of the same frame, after the send (so send_us stays the sendto alone): MIC checked,
+         * payload decrypted, checked against the reading sealed */
+        c0 = cyc_now();
+        int ol = app_open(fr, fl, out);
+        uint64_t open_cyc = cyc_since(c0);
+        double t3 = now_us();
+        if (ol != payload || memcmp(out, pt, payload)) die("air frame failed to open again", app_aead_label());
+        printf("air,%d,%u,%.3f,%.3f", m, fc, t1 - t0, t2 - t1);
+        put_cyc(seal_cyc); printf(",%.3f", t3 - t2); put_cyc(open_cyc); printf("\n");
     }
     fflush(stdout);
     struct timeval tmo = {1, 0};  /* wait in 1 s slices */
